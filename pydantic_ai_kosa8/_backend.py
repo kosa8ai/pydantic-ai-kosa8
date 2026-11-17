@@ -4,7 +4,12 @@ The backend implements `SupportsCommands`; `Workspace` derives the file operatio
 (read, write, stat, list, realpath, ...) through the sandbox's shell, so path checks and
 error types follow Pydantic AI's own rules.
 
-How a command runs (one exec request to the kosa8 Cloud API):
+How a command runs (buffered exec requests to the kosa8 Cloud API):
+
+- Every request is a buffered exec. kosa8's streamed exec can run in a PID namespace and `/tmp`
+  of its own, where a later request cannot see or stop the processes it started.
+- One request starts the wrapper below in the background and returns; further requests wait for
+  it, each for at most `_WAIT_S` seconds, so a command may run longer than one buffered exec.
 
 - A POSIX `sh` wrapper starts the command in a process group of its own (`setsid`, or job
   control where `setsid` is missing), with stdin at EOF and stdout/stderr redirected to files in
@@ -62,7 +67,11 @@ _MAX_CAPTURE_BYTES = 10 * 1024 * 1024
 # Raw bytes of a staged command per exec, when the files API is not available.
 _STAGE_CHUNK_BYTES = 30_000
 _SERVER_GRACE_S = 15
+# Seconds one wait request polls for the wrapper to finish (under the buffered exec limit).
+_WAIT_S = 50
 _KILL_TIMEOUT_S = 15
+_GONE_CHECKS = 6
+_GONE_CHECK_INTERVAL_S = 0.5
 
 _SANDBOX_ID_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$')
 _ENV_NAME_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
@@ -93,6 +102,21 @@ _RUN = (
     'os=$(wc -c < "$r/o"); es=$(wc -c < "$r/e"); os=$((os + 0)); es=$((es + 0)); '
     'echo "K8RUN $rc $to $os $es"; '
     'if [ $((os + es)) -le "$n" ]; then base64 < "$r/o"; echo K8SEP; base64 < "$r/e"; rm -rf "$r"; fi'
+)
+
+# $1 the wrapper script, $2 run dir: start the wrapper detached; it writes its answer to $2.out, then $2.done.
+_LAUNCH = (
+    'r=$2; mkdir -p "${r%/*}" 2>/dev/null; rm -f "$r.out" "$r.done"; '
+    'if command -v setsid >/dev/null 2>&1; then '
+    'setsid sh -c \'sh -c "$1" k8 >"$2.out" 2>/dev/null; : >"$2.done"\' k8 "$1" "$r" </dev/null >/dev/null 2>&1 & '
+    'else ( sh -c "$1" k8 >"$r.out" 2>/dev/null; : >"$r.done" ) </dev/null >/dev/null 2>&1 & fi; '
+    'echo K8STARTED'
+)
+
+# $1 run dir, $2 tenths of a second to wait: print the wrapper's answer once it is done, else K8WAIT.
+_WAIT = (
+    'r=$1; i=0; while [ ! -f "$r.done" ] && [ "$i" -lt "$2" ]; do sleep 0.1; i=$((i + 1)); done; '
+    'if [ -f "$r.done" ]; then cat "$r.out"; rm -f "$r.out" "$r.done"; else echo K8WAIT; fi'
 )
 
 # $1 run dir: mark it cancelled and kill the command's process group, if it started.
@@ -218,7 +242,7 @@ class Kosa8WorkspaceBackend:
         if self._client is not None:
             return self._client
         if self._own_client is None:
-            self._own_client = AsyncKosa8Client(self._api_key, base_url=self._base_url)
+            self._own_client = AsyncKosa8Client(self._api_key, base_url=self._base_url, stream=False)
         return self._own_client
 
     async def aclose(self) -> None:
@@ -286,14 +310,20 @@ class Kosa8WorkspaceBackend:
     async def _raise_if_gone(self, sandbox_id: str, error: Kosa8Error) -> None:
         if _is_gone(error):
             raise WorkspaceUnavailableError(f'kosa8 sandbox {sandbox_id!r} no longer exists') from error
-        try:
-            box = await self.client().get_sandbox(sandbox_id)
-        except Kosa8Error as check:
-            if _is_gone(check):
-                raise WorkspaceUnavailableError(f'kosa8 sandbox {sandbox_id!r} no longer exists') from error
-            return
-        if box.get('state') in _GONE_STATES:
-            raise WorkspaceUnavailableError(f'kosa8 sandbox {sandbox_id!r} is {box.get("state")}') from error
+        # A host error while the sandbox is being deleted can come before the API reports it gone,
+        # so after a 5xx look again for a few seconds.
+        checks = _GONE_CHECKS if error.status is not None and error.status >= 500 else 1
+        for attempt in range(checks):
+            if attempt:
+                await anyio.sleep(_GONE_CHECK_INTERVAL_S)
+            try:
+                box = await self.client().get_sandbox(sandbox_id)
+            except Kosa8Error as check:
+                if _is_gone(check):
+                    raise WorkspaceUnavailableError(f'kosa8 sandbox {sandbox_id!r} no longer exists') from error
+                return
+            if box.get('state') in _GONE_STATES:
+                raise WorkspaceUnavailableError(f'kosa8 sandbox {sandbox_id!r} is {box.get("state")}') from error
 
     # Commands ----------------------------------------------------------------
 
@@ -336,18 +366,14 @@ class Kosa8WorkspaceBackend:
         if timeout is not None:
             secs = max(1, math.ceil(timeout))
             k8['K8_TIMEOUT'] = str(secs)
-        request = ExecRequest(
-            argv=['/bin/sh', '-c', _RUN, 'k8'],
-            env={**user_env, **k8},
-            timeout=None if secs is None else secs + _SERVER_GRACE_S,
-        )
+        request = ExecRequest(argv=['/bin/sh', '-c', _LAUNCH, 'k8', _RUN, run_dir], env={**user_env, **k8})
         staged: str | None = None
         try:
             if len(json.dumps({'cmd': request.argv, 'env': [f'{k}={v}' for k, v in request.env.items()]})) > _BODY_LIMIT:
                 staged = await self._stage(f'{run_dir}.sh', script.encode('utf-8'))
                 del request.env['K8_CMD']
                 request.env['K8_CMDFILE'] = staged
-            out = await self._exec(request)
+            out = await self._run_detached(request, run_dir, secs)
         except Kosa8TimeoutError as error:
             await self._kill(run_dir)
             raise WorkspaceTimeoutError(f'the command did not finish in time on kosa8: {error}') from error
@@ -355,6 +381,21 @@ class Kosa8WorkspaceBackend:
             await self._kill(run_dir)
             raise
         return await self._result(out, run_dir, timeout)
+
+    async def _run_detached(self, request: ExecRequest, run_dir: str, secs: int | None) -> ExecOutput:
+        started = await self._exec(request)
+        if started.exit_code != 0 or started.stdout.strip() != 'K8STARTED':
+            detail = (started.stderr or started.stdout).strip()[:300]
+            raise WorkspaceError(f'kosa8 could not start the command (exit {started.exit_code}): {detail}')
+        deadline = None if secs is None else anyio.current_time() + secs + _SERVER_GRACE_S
+        wait = ExecRequest(argv=['/bin/sh', '-c', _WAIT, 'k8', run_dir, str(_WAIT_S * 10)])
+        while True:
+            out = await self._exec(wait)
+            if out.exit_code == 0 and out.stdout.strip() == 'K8WAIT':
+                if deadline is not None and anyio.current_time() > deadline:
+                    raise Kosa8TimeoutError('the command outlived its timeout in the sandbox')
+                continue
+            return ExecOutput(exit_code=out.exit_code, stdout=out.stdout, stderr=out.stderr)
 
     async def _result(self, out: ExecOutput, run_dir: str, timeout: float | None) -> CommandResult:
         if out.timed_out:
