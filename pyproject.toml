@@ -1,0 +1,76 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pydantic-ai-kosa8"
+version = "0.1.0"
+description = "kosa8 Cloud microVM sandboxes as Pydantic AI workspaces"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "kosa8" }]
+requires-python = ">=3.11,<4.0"
+keywords = ["pydantic-ai", "sandbox", "workspace", "kosa8", "microvm", "agents"]
+classifiers = [
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "pydantic-ai-slim>=2.69.0,<3",
+    "httpx>=0.27",
+    "anyio>=4",
+]
+
+[project.urls]
+Homepage = "https://kosa8.com"
+Documentation = "https://github.com/kosa8ai/pydantic-ai-kosa8#readme"
+Repository = "https://github.com/kosa8ai/pydantic-ai-kosa8"
+Issues = "https://github.com/kosa8ai/pydantic-ai-kosa8/issues"
+
+[dependency-groups]
+test = [
+    "pytest>=8",
+    "anyio[trio]>=4",
+]
+dev = [
+    "pytest>=8",
+    "ruff>=0.6",
+    "mypy>=1.10",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["pydantic_ai_kosa8"]
+
+[tool.hatch.build.targets.sdist]
+include = ["pydantic_ai_kosa8", "tests", "README.md", "LICENSE", "CHANGELOG.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["kosa8_live: runs against kosa8 Cloud (needs KOSA8_API_KEY and PYDANTIC_AI_KOSA8_LIVE=1)"]
+
+[tool.ruff]
+line-length = 140
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "ASYNC", "RUF100"]
+ignore = ["ASYNC109"]
+
+[tool.ruff.lint.per-file-ignores]
+"pydantic_ai_kosa8/_kosa8.py" = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = false
+files = ["pydantic_ai_kosa8"]
+
+[tool.ruff.format]
+quote-style = "single"
+# _kosa8.py is vendored unchanged from the other kosa8 integrations.
+exclude = ["pydantic_ai_kosa8/_kosa8.py"]
