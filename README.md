@@ -10,7 +10,7 @@ Run a [Pydantic AI](https://ai.pydantic.dev) agent's commands and file edits in 
 pip install pydantic-ai-kosa8
 ```
 
-Set `KOSA8_API_KEY` to a kosa8 Cloud API key (create one at [app.kosa8.com](https://app.kosa8.com)). kosa8 Cloud is a paid service, with plans from $29/month; there is no free tier.
+Set `KOSA8_API_KEY` to a kosa8 Cloud API key (create one at [app.kosa8.com](https://app.kosa8.com)). The Starter plan is free with no card and includes $10 of one-time kosa8 Cloud usage; paid plans start at $29 a month ([pricing](https://kosa8.com/pricing/)).
 
 ## Quick start
 
@@ -72,6 +72,8 @@ Errors from kosa8 Cloud are typed: `Kosa8PaymentRequiredError` (402, with `upgra
 - returns stdout and stderr base64-encoded, so any bytes survive (undecodable bytes become U+FFFD), and reads large output back in chunks.
 
 File operations (read, write, stat, list, remove, realpath) come from Pydantic AI's `Workspace`, which derives them through the sandbox's shell, so path handling and error types match Pydantic AI's other backends. The sandbox image needs `sh`, `base64`, `dd`, `find` and the other coreutils, which kosa8's templates include.
+
+`tests/test_harness.py` runs an `Agent` with Pydantic AI Harness's `Shell` and `FileSystem` capabilities on top of `Kosa8Sandbox`, and checks that their `write_file`, `run_command` and `read_file` calls land in the sandbox. It runs against the bundled fake kosa8 API, and against kosa8 Cloud in the live tier.
 
 The backend passes Pydantic AI's `WorkspaceBackendSuite` conformance suite (39 of 40 rules run and pass against the bundled fake kosa8 API; the 40th is for the optional `SupportsRealpath` protocol, which this backend leaves to the shell).
 
